@@ -26,8 +26,8 @@ import (
 
 type ImageResizer struct {
 	weedMasterHostPort string
+	redisPool          *redis.Pool
 	redisHostPort      string
-	redisConn          redis.Conn
 	hosts              map[string]string
 }
 
@@ -46,23 +46,6 @@ func (i ImageResizer) AddWebService() {
 	ws.Produces("image/jpeg;image/png;image/webp")
 	ws.Route(ws.GET("/images/{id}").To(i.resizeImagick))
 	restful.Add(ws)
-}
-
-func (i *ImageResizer) reconnectRedis() {
-	i.disconnectRedis()
-	log.Printf("Connecting to Redis on %s\n", i.redisHostPort)
-	c, err := redis.Dial("tcp", i.redisHostPort)
-	if err != nil {
-		log.Fatal(err)
-	}
-	i.redisConn = c
-}
-
-func (i *ImageResizer) disconnectRedis() {
-	if i.redisConn != nil {
-		i.redisConn.Close()
-		i.redisConn = nil
-	}
 }
 
 func (i ImageResizer) lookupUrl(id string) string {
@@ -106,11 +89,14 @@ func (i ImageResizer) resizeImagick(req *restful.Request, resp *restful.Response
 	// Schedule cleanup
 	defer mw.Destroy()
 
-	reply, err := i.redisConn.Do("GET", id)
+	redisConn := i.redisPool.Get()
+	reply, err := redisConn.Do("GET", id)
 	if err != nil {
 		resp.WriteErrorString(500, "Redis GET failed:"+err.Error())
 		return
 	}
+	defer redisConn.Close()
+
 	if reply == nil {
 		resp.WriteErrorString(404, "Redis says: no such id:"+id)
 		return
@@ -175,13 +161,29 @@ func main() {
 	// Schedule cleanup
 	defer imagick.Terminate()
 
+	pool := &redis.Pool{
+		MaxIdle:     3,
+		IdleTimeout: 240 * time.Second,
+		Dial: func() (redis.Conn, error) {
+			c, err := redis.Dial("tcp", "10.10.135.91:6379")
+			if err != nil {
+				return nil, err
+			}
+			return c, err
+		},
+		TestOnBorrow: func(c redis.Conn, t time.Time) error {
+			_, err := c.Do("PING")
+			return err
+		},
+	}
+	defer pool.Close()
+
 	resizer := ImageResizer{
-		redisHostPort:      "10.10.135.91:6379",
+		redisPool:          pool,
 		weedMasterHostPort: "node5.kluster.local.nl.bol.com:9333",
 		hosts:              map[string]string{}}
-	resizer.reconnectRedis()
+
 	resizer.AddWebService()
-	defer resizer.disconnectRedis()
 
 	log.Printf("start listening on localhost:8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
